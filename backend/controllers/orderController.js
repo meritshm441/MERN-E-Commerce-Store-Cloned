@@ -1,3 +1,4 @@
+import paystack from "../config/paystack.js";
 import Order from "../models/orderModel.js";
 import Product from "../models/productModel.js";
 
@@ -36,22 +37,22 @@ const createOrder = async (req, res) => {
     }
 
     const itemsFromDB = await Product.find({
-      _id: { $in: orderItems.map((x) => x._id) },
+      _id: { $in: orderItems.map((x) => x.product) },
     });
 
     const dbOrderItems = orderItems.map((itemFromClient) => {
       const matchingItemFromDB = itemsFromDB.find(
-        (itemFromDB) => itemFromDB._id.toString() === itemFromClient._id
+        (itemFromDB) => itemFromDB._id.toString() === itemFromClient.product
       );
 
       if (!matchingItemFromDB) {
         res.status(404);
-        throw new Error(`Product not found: ${itemFromClient._id}`);
+        throw new Error(`Product not found: ${itemFromClient.product}`);
       }
 
       return {
         ...itemFromClient,
-        product: itemFromClient._id,
+        product: itemFromClient.product,
         price: matchingItemFromDB.price,
         _id: undefined,
       };
@@ -157,22 +158,74 @@ const findOrderById = async (req, res) => {
   }
 };
 
-const markOrderAsPaid = async (req, res) => {
+const markOrderAsPaid = async ({
+  amount,
+  status,
+  paid_at: paidAt,
+  reference: paystackReference,
+  id: paystackTransactionId,
+}) => {
   try {
-    const order = await Order.findById(req.params.id);
+    const order = await Order.findOne({ paystackReference });
+
+    if (order.paidAt) return;
+
+    if (
+      status !== "success" ||
+      paidAt === null ||
+      amount / 100 !== order.totalPrice
+    ) {
+      throw new Error(`Order is not paid`);
+    }
 
     if (order) {
       order.isPaid = true;
-      order.paidAt = Date.now();
-      order.paymentResult = {
-        id: req.body.id,
-        status: req.body.status,
-        update_time: req.body.update_time,
-        email_address: req.body.payer.email_address,
-      };
+      order.paidAt = paidAt;
+      order.paystackTransactionId = paystackTransactionId;
 
-      const updateOrder = await order.save();
-      res.status(200).json(updateOrder);
+      await order.save();
+    } else {
+      throw new Error("Order not found");
+    }
+  } catch (error) {
+    throw new Error(error.message);
+  }
+};
+
+const payOrder = async (req, res) => {
+  try {
+    const { callback_url, order } = req.body;
+
+    // Validation
+    switch (true) {
+      case !callback_url:
+        return res.json({ error: "callback_url is required" });
+      case !order:
+        return res.json({ error: "Order is required" });
+    }
+
+    const foundOrder = await Order.findById(order).populate("user", "id email");
+
+    const transaction = await paystack.initializeTransaction({
+      amount: (foundOrder.totalPrice * 100).toString(),
+      currency: "GHS",
+      email: foundOrder.user.email,
+      callback_url,
+    });
+
+    if (foundOrder.paidAt) {
+      res.status(400);
+      throw new Error("Order has been paid for");
+    }
+
+    if (transaction) {
+      foundOrder.paystackReference = transaction.data.reference;
+
+      const updateOrder = await foundOrder.save();
+      res.status(200).json({
+        transaction,
+        order: updateOrder,
+      });
     } else {
       res.status(404);
       throw new Error("Order not found");
@@ -210,5 +263,6 @@ export {
   calcualteTotalSalesByDate,
   findOrderById,
   markOrderAsPaid,
+  payOrder,
   markOrderAsDelivered,
 };
